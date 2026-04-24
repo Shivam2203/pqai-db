@@ -15,24 +15,58 @@ import boto3
 import dotenv
 from fastapi import FastAPI, Response
 from utils import image
+from pymongo import MongoClient
 
 dotenv.load_dotenv()
 
-from core.storage import S3Bucket
+from core.storage import S3Bucket, MongoDB
 
-AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
+# Determine storage type
+STORAGE_TYPE = os.environ.get("STORAGE", "s3").lower()
+print(f"Using storage type: {STORAGE_TYPE}")
 
-config = botocore.config.Config(
-    read_timeout=400, connect_timeout=400, retries={"max_attempts": 0}
-)
-credentials = {
-    "aws_access_key_id": AWS_ACCESS_KEY_ID,
-    "aws_secret_access_key": AWS_SECRET_ACCESS_KEY,
-}
-botoclient = boto3.client("s3", **credentials, config=config)
-bucket_name = os.environ.get("AWS_S3_BUCKET_NAME")
-s3_storage = S3Bucket(botoclient, bucket_name)
+# Initialize storage based on type
+if STORAGE_TYPE == "mongodb":
+    # Initialize MongoDB
+    MONGO_HOST = os.environ.get("MONGO_HOST", "localhost")
+    MONGO_PORT = int(os.environ.get("MONGO_PORT", 27017))
+    MONGO_DB = os.environ.get("MONGO_DB", "pqai")
+    MONGO_COLL = os.environ.get("MONGO_COLL", "bibliography")
+    
+    mongo_client = MongoClient(MONGO_HOST, MONGO_PORT)
+    storage = MongoDB(mongo_client, MONGO_DB, MONGO_COLL, "publicationNumber")
+    print(f"MongoDB connected: {MONGO_HOST}:{MONGO_PORT}/{MONGO_DB}/{MONGO_COLL}")
+    
+    # S3 is still needed for drawings (optional)
+    AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
+    AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    config = botocore.config.Config(
+        read_timeout=400, connect_timeout=400, retries={"max_attempts": 0}
+    )
+    credentials = {
+        "aws_access_key_id": AWS_ACCESS_KEY_ID,
+        "aws_secret_access_key": AWS_SECRET_ACCESS_KEY,
+    }
+    botoclient = boto3.client("s3", **credentials, config=config)
+    bucket_name = os.environ.get("AWS_S3_BUCKET_NAME")
+    s3_storage = S3Bucket(botoclient, bucket_name) if bucket_name else None
+else:
+    # Initialize S3 only
+    AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
+    AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    
+    config = botocore.config.Config(
+        read_timeout=400, connect_timeout=400, retries={"max_attempts": 0}
+    )
+    credentials = {
+        "aws_access_key_id": AWS_ACCESS_KEY_ID,
+        "aws_secret_access_key": AWS_SECRET_ACCESS_KEY,
+    }
+    botoclient = boto3.client("s3", **credentials, config=config)
+    bucket_name = os.environ.get("AWS_S3_BUCKET_NAME")
+    storage = S3Bucket(botoclient, bucket_name)
+    s3_storage = storage
+    print(f"S3 bucket configured: {bucket_name}")
 
 app = FastAPI()
 
@@ -71,18 +105,49 @@ async def get_doc(doc_id: str):
     """Return a document's data in JSON format
     """
     try:
-        doc = s3_storage.get(f"patents/{doc_id}.json")
+        if STORAGE_TYPE == "mongodb":
+            # For MongoDB, try different patent number formats
+            from pymongo import MongoClient
+            client = MongoClient('localhost', 27017)
+            db = client['pqai']
+            coll = db['bibliography']
+            
+            # Try different query formats
+            query = {
+                "$or": [
+                    {"publicationNumber": doc_id},
+                    {"publicationNumber": f"US{doc_id}"},
+                    {"publicationNumber": f"US{doc_id}A"},
+                    {"number": doc_id},
+                    {"publicationNumber": f"US{doc_id.replace('US', '')}"}
+                ]
+            }
+            
+            result = coll.find_one(query)
+            if result:
+                result.pop('_id', None)
+                return result
+            else:
+                return Response(status_code=404)
+        else:
+            # For S3
+            doc = storage.get(f"patents/{doc_id}.json")
+            return json.loads(doc)
     except ClientError as e:
         if e.response["Error"]["Code"] == "NoSuchKey":
             return Response(status_code=404)
         return Response(status_code=500)
-    return json.loads(doc)
+    except Exception as e:
+        print(f"Error: {e}")
+        return Response(status_code=500)
 
 
 @app.get("/patents/{doc_id}/drawings")
 async def list_drawings(doc_id: str):
     """Return a list of drawings associated with a document, e.g., [1, 2, 3]
     """
+    if not s3_storage:
+        return Response(status_code=501, content="Drawings not configured")
     prefix = get_drawing_prefix(doc_id)
     keys = s3_storage.ls(prefix)
     if not keys:
@@ -95,6 +160,8 @@ async def list_drawings(doc_id: str):
 async def get_drawing(doc_id: str, drawing_num: int):
     """Return image data of a particular drawing
     """
+    if not s3_storage:
+        return Response(status_code=501, content="Drawings not configured")
     if drawing_num < 1:
         return Response(status_code=404)
     prefix = get_drawing_prefix(doc_id)
@@ -112,6 +179,8 @@ async def get_drawing(doc_id: str, drawing_num: int):
 def get_patent_thumbnail(doc_id: str, thumbnail_num: str, w: int = 100, h: int = 100):
     """Returns image data of a particular thumbnail.
     """
+    if not s3_storage:
+        return Response(status_code=501, content="Drawings not configured")
     if thumbnail_num < 1:
         return Response(status_code=404)
     prefix = get_drawing_prefix(doc_id)
@@ -126,6 +195,21 @@ def get_patent_thumbnail(doc_id: str, thumbnail_num: str, w: int = 100, h: int =
     return Response(content=tif_data_thumbnail, media_type="image/tiff")
 
 
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "message": "PQAI Database API",
+        "storage_type": STORAGE_TYPE,
+        "endpoints": [
+            "/patents/{doc_id}",
+            "/patents/{doc_id}/drawings",
+            "/patents/{doc_id}/drawings/{drawing_num}",
+            "/patents/{doc_id}/thumbnails/{thumbnail_num}"
+        ]
+    }
+
+
 if __name__ == "__main__":
-    port = int(os.environ["PORT"])
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
